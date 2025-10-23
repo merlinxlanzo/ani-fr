@@ -81,7 +81,7 @@ fn watch(link: &str) {
 }
 
 fn main() {
-    let file_path = ProjectDirs::from("", "B0SE", "ani-dl")
+    let file_path = ProjectDirs::from("", "B0SE", "ani-fr")
         .expect("Failed to get project directory")
         .data_dir()
         .join("anime_data.json");
@@ -157,22 +157,24 @@ fn main() {
             if ans4 == "Télécharger" {
                 download(ans3);
             } else {
-                let mut episode_numbers = vec![];
-                for i in 1..=ans3.episodes.len() {
-                    episode_numbers.push(i);
-                }
+                let episode_numbers: Vec<String> = (1..=ans3.episodes.len())
+                    .map(|i| format!("Episode {}", i))
+                    .collect();
                 loop {
-                    let ans5 =
+                    let ans5_idx =
                         match Select::new("Sélectionnez l'épisode: ", episode_numbers.clone())
                             .prompt()
                         {
-                            Ok(v) => v,
+                            Ok(v) => {
+                                // Find the index of the selected episode string
+                                episode_numbers.iter().position(|x| x == &v).unwrap()
+                            }
                             Err(InquireError::OperationInterrupted) => std::process::exit(0),
                             Err(InquireError::OperationCanceled) => break,
                             Err(e) => panic!("{}", e),
                         };
 
-                    watch(&ans3.episodes[ans5 - 1]);
+                    watch(&ans3.episodes[ans5_idx]);
                 }
             }
         }

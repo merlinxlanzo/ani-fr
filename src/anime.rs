@@ -18,7 +18,7 @@ pub struct Media {
 
 impl Display for Media {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        write!(f, "saison {}", self.season.to_string().yellow())
+        write!(f, "saison {}", self.season.to_string().blue())
     }
 }
 

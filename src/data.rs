@@ -13,10 +13,17 @@ const LATEST_COMMIT_URL: &str =
 
 fn get_last_commit_time() -> SystemTime {
     let file = reqwest::blocking::get(LATEST_COMMIT_URL)
-        .unwrap()
+        .expect("Failed to fetch latest commit time")
         .text()
-        .unwrap();
-    let date_time = DateTime::parse_from_rfc3339(file.trim()).unwrap();
+        .expect("Failed to read response text");
+
+    let trimmed = file.trim();
+    let date_time = DateTime::parse_from_rfc3339(trimmed)
+        .unwrap_or_else(|e| {
+            eprintln!("Failed to parse date from '{}': {}", trimmed, e);
+            eprintln!("Using current time instead");
+            DateTime::parse_from_rfc3339(&chrono::Utc::now().to_rfc3339()).unwrap()
+        });
     UNIX_EPOCH + Duration::from_secs(date_time.timestamp() as u64)
 }
 
@@ -33,7 +40,7 @@ fn download_file(file_path: &Path) {
 }
 
 pub fn get_file(overwrite: bool) {
-    let dir = ProjectDirs::from("", "B0SE", "ani-dl").expect("Failed to get project directory");
+    let dir = ProjectDirs::from("", "B0SE", "ani-fr").expect("Failed to get project directory");
     let data_dir = dir.data_dir();
     let file_path = data_dir.join("anime_data.json");
 
