@@ -75,10 +75,19 @@ fn download(mut anime: Media) {
 }
 
 fn watch(link: &str) {
-    match std::process::Command::new("mpv").arg(link).output() {
-        Ok(_) => (),
-        Err(e) => eprintln!("Impossible de lancer mpv: {}. Vérifiez que mpv est installé et dans le PATH.", e),
+    let mpv_paths = ["mpv", "C:\\Program Files\\MPV Player\\mpv.exe"];
+    for path in mpv_paths {
+        if let Ok(mut child) = std::process::Command::new(path).arg(link).spawn() {
+            let _ = child.wait();
+            return;
+        }
     }
+    #[cfg(target_os = "windows")]
+    let _ = std::process::Command::new("cmd").args(["/C", "start", "", link]).spawn();
+    #[cfg(target_os = "linux")]
+    let _ = std::process::Command::new("xdg-open").arg(link).spawn();
+    #[cfg(target_os = "macos")]
+    let _ = std::process::Command::new("open").arg(link).spawn();
 }
 
 fn main() {
