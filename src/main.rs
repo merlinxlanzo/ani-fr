@@ -10,6 +10,7 @@ use std::{
 use threadpool::ThreadPool;
 
 mod anime;
+mod autoclicker;
 mod data;
 
 fn parse_range(input: &str) -> Result<(u32, u32), String> {
@@ -74,10 +75,10 @@ fn download(mut anime: Media) {
 }
 
 fn watch(link: &str) {
-    std::process::Command::new("mpv")
-        .arg(link)
-        .output()
-        .expect("Failed to execute command");
+    match std::process::Command::new("mpv").arg(link).output() {
+        Ok(_) => (),
+        Err(e) => eprintln!("Impossible de lancer mpv: {}. Vérifiez que mpv est installé et dans le PATH.", e),
+    }
 }
 
 fn main() {
@@ -102,14 +103,27 @@ fn main() {
 
     sp.stop_with_symbol(" ✔️ ");
 
-    let ans = match Select::new("Sélectionnez les animes: ", animes.get_name()).prompt() {
+    let mut names = animes.get_name();
+    names.push("Otokurikka".to_string());
+
+    let ans = match Select::new("Sélectionnez les animes: ", names).prompt() {
         Ok(v) => v,
         Err(InquireError::OperationInterrupted) => std::process::exit(0),
         Err(InquireError::OperationCanceled) => std::process::exit(0),
         Err(e) => panic!("{}", e),
     };
 
-    let animes2 = animes.get_seasons_from_str(&ans);
+    let is_otokurikka = ans == "Otokurikka";
+
+    let animes2 = if is_otokurikka {
+        let episodes: Vec<String> = (1..=25).map(|i| format!("otokurikka_ep_{}", i)).collect();
+        vec![
+            Media::new("Otokurikka", "vf", 1, "anime", episodes.clone()),
+            Media::new("Otokurikka", "vostfr", 1, "anime", episodes),
+        ]
+    } else {
+        animes.get_seasons_from_str(&ans)
+    };
 
     let vf = animes2.iter().any(|x| x.lang == "vf");
 
@@ -166,7 +180,6 @@ fn main() {
                             .prompt()
                         {
                             Ok(v) => {
-                                // Find the index of the selected episode string
                                 episode_numbers.iter().position(|x| x == &v).unwrap()
                             }
                             Err(InquireError::OperationInterrupted) => std::process::exit(0),
@@ -174,7 +187,11 @@ fn main() {
                             Err(e) => panic!("{}", e),
                         };
 
-                    watch(&ans3.episodes[ans5_idx]);
+                    if is_otokurikka {
+                        autoclicker::run_episode(ans5_idx as u32 + 1);
+                    } else {
+                        watch(&ans3.episodes[ans5_idx]);
+                    }
                 }
             }
         }

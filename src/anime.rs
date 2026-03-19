@@ -16,6 +16,18 @@ pub struct Media {
     pub episodes: Vec<String>,
 }
 
+impl Media {
+    pub fn new(name: &str, lang: &str, season: i8, media_type: &str, episodes: Vec<String>) -> Self {
+        Self {
+            name: name.to_string(),
+            lang: lang.to_string(),
+            season,
+            media_type: media_type.to_string(),
+            episodes,
+        }
+    }
+}
+
 impl Display for Media {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         write!(f, "saison {}", self.season.to_string().blue())

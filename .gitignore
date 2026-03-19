@@ -1,2 +1,4 @@
 target/
 anime_data.json
+.claude/
+Cargo.lock
