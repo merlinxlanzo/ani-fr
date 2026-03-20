@@ -351,11 +351,13 @@ fn main() {
                             episode_numbers.push(format!("Épisode {}", i));
                         }
 
+                        let mut last_ep_idx: usize = 0;
                         loop {
                             let ans5 = match Select::new(
                                 "Sélectionnez l'épisode à regarder (Échap pour retour) : ",
                                 episode_numbers.clone(),
                             )
+                            .with_starting_cursor(last_ep_idx)
                             .prompt()
                             {
                                 Ok(v) => v,
@@ -365,6 +367,7 @@ fn main() {
                             };
 
                             let ep_idx = ans5.replace("Épisode ", "").parse::<usize>().unwrap() - 1;
+                            last_ep_idx = ep_idx;
 
                             if is_otokurikka {
                                 autoclicker::run_episode(ep_idx as u32 + 1);
