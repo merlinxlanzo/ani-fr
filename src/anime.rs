@@ -12,7 +12,7 @@ pub struct Media {
     pub name: String,
     pub lang: String,
     pub season: i8,
-    media_type: String,
+    pub media_type: String,
     pub episodes: Vec<String>,
 }
 
@@ -30,7 +30,11 @@ impl Media {
 
 impl Display for Media {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        write!(f, "saison {}", self.season.to_string().yellow())
+        if self.media_type == "film" {
+            write!(f, "{}", "film".yellow())
+        } else {
+            write!(f, "saison {}", self.season.to_string().yellow())
+        }
     }
 }
 

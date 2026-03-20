@@ -392,7 +392,12 @@ fn main() {
                 continue 'lang_loop;
             }
 
-            animes3.sort_by(|a, b| a.season.partial_cmp(&b.season).unwrap());
+            // Sort: seasons first (by number), then films
+            animes3.sort_by(|a, b| {
+                let a_is_film = a.media_type == "film";
+                let b_is_film = b.media_type == "film";
+                a_is_film.cmp(&b_is_film).then(a.season.cmp(&b.season))
+            });
 
             let mut used_history_shortcut = from_history;
             'season_loop: loop {
@@ -402,9 +407,12 @@ fn main() {
                         Some(a) => a.clone(),
                         None => animes3[0].clone(),
                     }
+                } else if animes3.len() == 1 {
+                    // Only one option (single season or single film) — skip selection
+                    animes3[0].clone()
                 } else {
                     match Select::new(
-                        "Sélectionnez la saison (Échap pour retour) : ",
+                        "Sélectionnez la saison / film (Échap pour retour) : ",
                         animes3.clone(),
                     )
                     .prompt()

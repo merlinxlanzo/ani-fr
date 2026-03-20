@@ -81,6 +81,30 @@ After installation, run:
 ani-fr
 ```
 
+## MyAnimeList Integration
+
+ani-fr can connect to your [MyAnimeList](https://myanimelist.net/) account to automatically track your watch progress and skip OP/ED.
+
+### Setting up MAL
+
+1. Go to [https://myanimelist.net/apiconfig](https://myanimelist.net/apiconfig) and create a new API client
+2. Fill in the form:
+   - **App Name**: anything you want (e.g. `ani-fr`)
+   - **App Type**: `web`
+   - **App Redirect URL**: `http://localhost:7878/callback`
+   - **Homepage URL**: can be left blank or any URL
+3. After creating the client, note your **Client ID** and **Client Secret**
+4. In ani-fr, select the MAL login option and enter your Client ID and Client Secret when prompted
+5. A browser window will open — log in to MAL and authorize the app
+6. Once authorized, you'll be redirected back and ani-fr will save your credentials
+
+### Features
+
+- **Automatic episode tracking** — your MAL list updates as you watch episodes
+- **OP/ED auto-skip** — opening and ending sequences are automatically skipped using [aniskip](https://aniskip.com/) data linked via MAL IDs
+- **Watch history** — your last 10 watched anime are saved locally for quick access with resume timestamps
+- **Auto anime matching** — ani-fr searches MAL to match French titles to MAL entries, with manual fallback if needed
+
 ## Thanks
 
 - [ani-cli](https://github.com/pystardust/ani-cli) for the inspiration

@@ -163,8 +163,8 @@ def scrape_catalogue_page(page: int, delay: float) -> list[CatalogueItem]:
     return items
 
 
-def scrape_catalogue(max_pages: Optional[int], delay: float, include_films: bool) -> list[CatalogueItem]:
-    """Scrape the full catalogue."""
+def scrape_catalogue(max_pages: Optional[int], delay: float) -> list[CatalogueItem]:
+    """Scrape the full catalogue (anime + films)."""
     all_items: list[CatalogueItem] = []
     page = 1
     limit = max_pages or 999
@@ -173,7 +173,6 @@ def scrape_catalogue(max_pages: Optional[int], delay: float, include_films: bool
         info(f"Scraping catalogue page {page}...")
         items = scrape_catalogue_page(page, delay)
         if not items:
-            # No more items means we've gone past the last page
             if page > 1:
                 break
             warn(f"No items found on page {page}")
@@ -183,7 +182,7 @@ def scrape_catalogue(max_pages: Optional[int], delay: float, include_films: bool
             type_lower = item.media_type.lower()
             if "anime" in type_lower:
                 all_items.append(item)
-            elif include_films and "film" in type_lower:
+            elif "film" in type_lower:
                 item.media_type = "film"
                 all_items.append(item)
 
@@ -276,13 +275,16 @@ def load_data(path: Path) -> dict:
     return {"media": []}
 
 
-def build_existing_keys(data: dict) -> dict[tuple, int]:
-    """Build a map of (normalized_name, lang, season) -> index and episode count."""
+def build_existing_keys(data: dict) -> tuple[dict[tuple, int], set[str]]:
+    """Build a map of (normalized_name, lang, season) -> episode count, and a set of known names."""
     keys: dict[tuple, int] = {}
-    for i, entry in enumerate(data.get("media", [])):
-        key = (normalize_name(entry["name"]), entry["lang"], entry.get("season", 1))
+    names: set[str] = set()
+    for entry in data.get("media", []):
+        norm = normalize_name(entry["name"])
+        key = (norm, entry["lang"], entry.get("season", 1))
         keys[key] = len(entry.get("episodes", []))
-    return keys
+        names.add(norm)
+    return keys, names
 
 
 def save_data(data: dict, path: Path, dry_run: bool) -> None:
@@ -323,14 +325,22 @@ def run(args: argparse.Namespace) -> None:
     info(f"Data file: {data_path}")
 
     data = load_data(data_path)
-    existing = build_existing_keys(data)
-    info(f"Loaded {len(existing)} existing entries")
+    existing, known_names = build_existing_keys(data)
+    info(f"Loaded {len(existing)} existing entries ({len(known_names)} unique animes)")
 
     # Scrape catalogue
-    catalogue = scrape_catalogue(args.pages, args.delay, args.include_films)
-    info(f"Found {len(catalogue)} anime(s) in catalogue")
+    catalogue = scrape_catalogue(args.pages, args.delay)
+    info(f"Found {len(catalogue)} anime(s)/film(s) in catalogue")
 
-    stats = {"new_animes": 0, "new_seasons": 0, "new_episodes": 0, "updated": 0}
+    # Filter out already fully scraped animes (unless checking for updates)
+    if not args.check_updates:
+        before = len(catalogue)
+        catalogue = [item for item in catalogue if normalize_name(item.name) not in known_names]
+        skipped = before - len(catalogue)
+        if skipped:
+            info(f"Skipped {skipped} already scraped, {len(catalogue)} remaining")
+
+    stats = {"new_animes": 0, "new_seasons": 0, "new_episodes": 0, "updated": 0, "new_films": 0}
     seen_names: set[str] = set()
     new_entries: list[dict] = []
 
@@ -370,11 +380,13 @@ def run(args: argparse.Namespace) -> None:
 
             season_lang_pairs = discover_seasons(item.slug, args.delay)
 
+            consecutive_fails = 0
             for season, lang in season_lang_pairs:
                 key = (normalize_name(item.name), lang, season)
 
                 if key in existing:
                     if not args.check_updates:
+                        consecutive_fails = 0
                         continue
                     old_count = existing[key]
                     episodes = fetch_episodes(item.slug, season, lang, args.delay)
@@ -390,13 +402,26 @@ def run(args: argparse.Namespace) -> None:
                                     break
                         stats["updated"] += 1
                         stats["new_episodes"] += len(episodes) - old_count
+                    consecutive_fails = 0
                     continue
 
                 # New entry
                 episodes = fetch_episodes(item.slug, season, lang, args.delay)
                 if not episodes:
-                    warn(f"  No episodes found for {name_lower} S{season} {lang}, skipping")
+                    consecutive_fails += 1
+                    if consecutive_fails >= 2:
+                        break  # Stop trying more seasons for this anime
                     continue
+
+                # Skip phantom seasons (1 episode likely means a bad entry)
+                if len(episodes) == 1 and season > 1 and media_type != "film":
+                    warn(f"  Skipping {name_lower} S{season} {lang} (only 1 episode, likely phantom)")
+                    consecutive_fails += 1
+                    if consecutive_fails >= 2:
+                        break
+                    continue
+
+                consecutive_fails = 0
 
                 entry = AnimeEntry(
                     name=name_lower,
@@ -410,7 +435,10 @@ def run(args: argparse.Namespace) -> None:
                 existing[key] = len(episodes)
 
                 if name_lower not in seen_names:
-                    stats["new_animes"] += 1
+                    if media_type == "film":
+                        stats["new_films"] += 1
+                    else:
+                        stats["new_animes"] += 1
                     seen_names.add(name_lower)
 
                 stats["new_seasons"] += 1
@@ -431,6 +459,7 @@ def run(args: argparse.Namespace) -> None:
     print(f"{Fore.MAGENTA}Summary{Style.RESET_ALL}")
     print(f"{Fore.MAGENTA}{'=' * 50}{Style.RESET_ALL}")
     print(f"  New animes:   {Fore.GREEN}{stats['new_animes']}{Style.RESET_ALL}")
+    print(f"  New films:    {Fore.GREEN}{stats['new_films']}{Style.RESET_ALL}")
     print(f"  New seasons:  {Fore.GREEN}{stats['new_seasons']}{Style.RESET_ALL}")
     print(f"  New episodes: {Fore.GREEN}{stats['new_episodes']}{Style.RESET_ALL}")
     if args.check_updates:
@@ -451,11 +480,6 @@ def main() -> None:
         "--check-updates",
         action="store_true",
         help="Re-check existing entries for new episodes",
-    )
-    parser.add_argument(
-        "--include-films",
-        action="store_true",
-        help="Include films in addition to anime series",
     )
     parser.add_argument(
         "--dry-run",
