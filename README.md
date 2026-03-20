@@ -98,15 +98,9 @@ ani-fr can connect to your [MyAnimeList](https://myanimelist.net/) account to au
 5. A browser window will open — log in to MAL and authorize the app
 6. Once authorized, you'll be redirected back and ani-fr will save your credentials
 
-### Features
-
-- **Automatic episode tracking** — your MAL list updates as you watch episodes
-- **OP/ED auto-skip** — opening and ending sequences are automatically skipped using [aniskip](https://aniskip.com/) data linked via MAL IDs
-- **Watch history** — your last 10 watched anime are saved locally for quick access with resume timestamps
-- **Auto anime matching** — ani-fr searches MAL to match French titles to MAL entries, with manual fallback if needed
-
 ## Thanks
 
 - [ani-cli](https://github.com/pystardust/ani-cli) for the inspiration
 - [@S3nda](https://github.com/S3nda) for making the original scraper
 - [B0SEmc/ani-dl](https://github.com/B0SEmc/ani-dl) for the original project
+- [aniskip](https://aniskip.com/) for the OP/ED auto-skip data
