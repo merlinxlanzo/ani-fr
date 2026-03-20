@@ -303,6 +303,9 @@ def save_data(data: dict, path: Path, dry_run: bool) -> None:
 def resolve_data_path(cli_path: Optional[str]) -> Path:
     if cli_path:
         return Path(cli_path)
+    if sys.platform == "win32":
+        appdata = os.environ.get("APPDATA", os.path.expanduser("~\\AppData\\Roaming"))
+        return Path(appdata) / "B0SE" / "ani-fr" / "data" / "anime_data.json"
     data_dir = user_data_dir("ani-fr", "B0SE")
     return Path(data_dir) / "anime_data.json"
 
@@ -382,9 +385,23 @@ def run(args: argparse.Namespace) -> None:
                 f"  New: {name_lower} S{season} {lang} - {len(episodes)} episodes"
             )
 
-    # Merge and save
+    # Merge, dedup, and save
     if new_entries or stats["updated"]:
         data["media"].extend(new_entries)
+
+        seen: dict[tuple, int] = {}
+        deduped: list[dict] = []
+        for entry in data["media"]:
+            key = (entry["name"].strip().lower(), entry["lang"], entry.get("season", 1))
+            if key in seen:
+                idx = seen[key]
+                if len(entry.get("episodes", [])) > len(deduped[idx].get("episodes", [])):
+                    deduped[idx] = entry
+            else:
+                seen[key] = len(deduped)
+                deduped.append(entry)
+        data["media"] = deduped
+
         save_data(data, data_path, args.dry_run)
 
     # Summary
