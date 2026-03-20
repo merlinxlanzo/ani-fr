@@ -143,14 +143,79 @@ fn extract_speed(line: &str) -> Option<&str> {
     Some(line[at..eta].trim())
 }
 
-fn watch(link: &str) {
+fn write_mpv_script(skip_times: &[mal::SkipTime]) -> Option<std::path::PathBuf> {
+    let pos_file = mal::last_position_path();
+    let pos_file_escaped = pos_file.display().to_string().replace('\\', "\\\\");
+
+    let mut lua = String::new();
+
+    // Skip times section
+    if !skip_times.is_empty() {
+        lua.push_str("local skips = {\n");
+        for s in skip_times {
+            lua.push_str(&format!(
+                "  {{start={:.3}, ends={:.3}, type=\"{}\"}},\n",
+                s.start, s.end, s.skip_type
+            ));
+        }
+        lua.push_str("}\n");
+        lua.push_str(
+            r#"local skipped = {}
+mp.observe_property("time-pos", "number", function(_, pos)
+    if pos then
+        for i, s in ipairs(skips) do
+            if not skipped[i] and pos >= s.start and pos < s.ends then
+                mp.commandv("seek", tostring(s.ends), "absolute")
+                mp.osd_message("Skip " .. string.upper(s.type), 2)
+                skipped[i] = true
+            end
+        end
+    end
+end)
+"#,
+        );
+    }
+
+    // Save position on quit
+    lua.push_str(&format!(
+        r#"mp.register_event("shutdown", function()
+    local pos = mp.get_property_number("time-pos")
+    if pos then
+        local f = io.open("{}", "w")
+        if f then
+            f:write(string.format("%.3f", pos))
+            f:close()
+        end
+    end
+end)
+"#,
+        pos_file_escaped
+    ));
+
+    let dir = directories::ProjectDirs::from("", "B0SE", "ani-fr")
+        .expect("Failed to get project directory");
+    let script_path = dir.data_dir().join("aniskip.lua");
+    if std::fs::write(&script_path, &lua).is_ok() {
+        Some(script_path)
+    } else {
+        None
+    }
+}
+
+fn watch(link: &str, skip_times: &[mal::SkipTime]) {
+    // Clear old position
+    let _ = std::fs::remove_file(mal::last_position_path());
+
+    let script_path = write_mpv_script(skip_times);
     let mpv_paths = ["mpv", "C:\\Program Files\\MPV Player\\mpv.exe"];
     for path in mpv_paths {
-        if let Ok(mut child) = std::process::Command::new(path)
-            .arg("--ytdl-format=bestvideo[height<=1080]+bestaudio/best[height<=1080]/best")
-            .arg(link)
-            .spawn()
-        {
+        let mut cmd = std::process::Command::new(path);
+        cmd.arg("--ytdl-format=bestvideo[height<=1080]+bestaudio/best[height<=1080]/best");
+        if let Some(ref sp) = script_path {
+            cmd.arg(format!("--script={}", sp.display()));
+        }
+        cmd.arg(link);
+        if let Ok(mut child) = cmd.spawn() {
             let _ = child.wait();
             return;
         }
@@ -192,10 +257,31 @@ fn main() {
             ">>> Connexion MAL <<<".to_string()
         };
 
-        let mut all_anime_names = animes.get_name();
-        all_anime_names.push("Otokurikka".to_string());
-        all_anime_names.sort();
-        all_anime_names.insert(0, mal_label.clone());
+        let mut all_anime_names: Vec<String> = Vec::new();
+        all_anime_names.push(mal_label.clone());
+
+        // Add recent watch history at the top
+        let history = mal::load_history();
+        let mut history_labels: Vec<String> = Vec::new();
+        if !history.entries.is_empty() {
+            all_anime_names.push("─── Récemment regardés ───".to_string());
+            for entry in &history.entries {
+                let label = format!(
+                    "↪ {} - Ép.{} ({})",
+                    entry.name,
+                    entry.episode,
+                    mal::format_timestamp(entry.timestamp)
+                );
+                history_labels.push(label.clone());
+                all_anime_names.push(label);
+            }
+            all_anime_names.push("───────────────────────".to_string());
+        }
+
+        let mut anime_names = animes.get_name();
+        anime_names.push("Otokurikka".to_string());
+        anime_names.sort();
+        all_anime_names.extend(anime_names);
 
         let ans = match Select::new(
             "Sélectionnez les animes (Échap pour quitter) : ",
@@ -208,6 +294,25 @@ fn main() {
                 break 'main_loop;
             }
             Err(e) => panic!("{}", e),
+        };
+
+        // Skip separators
+        if ans == "─── Récemment regardés ───" || ans == "───────────────────────" {
+            continue 'main_loop;
+        }
+
+        // Handle history selection — extract real anime name, lang, season, episode
+        let mut history_episode: Option<usize> = None;
+        let mut history_lang: Option<String> = None;
+        let mut history_season: Option<i8> = None;
+        let ans = if let Some(hist_entry) = history_labels.iter().position(|l| *l == ans) {
+            let entry = &history.entries[hist_entry];
+            history_episode = Some(entry.episode);
+            history_lang = Some(entry.lang.clone());
+            history_season = Some(entry.season);
+            entry.name.clone()
+        } else {
+            ans
         };
 
         if ans == mal_label {
@@ -253,11 +358,14 @@ fn main() {
         };
 
         let vf = animes2.iter().any(|x| x.lang == "vf");
+        let from_history = history_lang.is_some();
 
         'lang_loop: loop {
             let mut ans2 = String::from("vostfr");
 
-            if vf {
+            if from_history {
+                ans2 = history_lang.take().unwrap_or_else(|| "vostfr".to_string());
+            } else if vf {
                 ans2 = match Select::new("VF ou VOSTFR ? (Échap pour retour)", vec!["VF", "VOSTFR"])
                     .prompt()
                 {
@@ -286,32 +394,46 @@ fn main() {
 
             animes3.sort_by(|a, b| a.season.partial_cmp(&b.season).unwrap());
 
+            let mut used_history_shortcut = from_history;
             'season_loop: loop {
-                let ans3 = match Select::new(
-                    "Sélectionnez la saison (Échap pour retour) : ",
-                    animes3.clone(),
-                )
-                .prompt()
-                {
-                    Ok(v) => v,
-                    Err(InquireError::OperationCanceled) => break 'season_loop,
-                    Err(InquireError::OperationInterrupted) => std::process::exit(0),
-                    Err(e) => panic!("{}", e),
-                };
-
-                'action_loop: loop {
-                    let options = vec!["Télécharger", "Regarder"];
-
-                    let ans4 = match Select::new(
-                        "Voulez-vous télécharger ou regarder l'anime ? (Échap pour retour)",
-                        options,
+                let ans3 = if used_history_shortcut {
+                    let target_season = history_season.unwrap_or(1);
+                    match animes3.iter().find(|a| a.season == target_season) {
+                        Some(a) => a.clone(),
+                        None => animes3[0].clone(),
+                    }
+                } else {
+                    match Select::new(
+                        "Sélectionnez la saison (Échap pour retour) : ",
+                        animes3.clone(),
                     )
                     .prompt()
                     {
                         Ok(v) => v,
-                        Err(InquireError::OperationCanceled) => break 'action_loop,
+                        Err(InquireError::OperationCanceled) => break 'season_loop,
                         Err(InquireError::OperationInterrupted) => std::process::exit(0),
                         Err(e) => panic!("{}", e),
+                    }
+                };
+
+                'action_loop: loop {
+                    let ans4 = if used_history_shortcut {
+                        used_history_shortcut = false;
+                        "Regarder"
+                    } else {
+                        let options = vec!["Télécharger", "Regarder"];
+
+                        match Select::new(
+                            "Voulez-vous télécharger ou regarder l'anime ? (Échap pour retour)",
+                            options,
+                        )
+                        .prompt()
+                        {
+                            Ok(v) => v,
+                            Err(InquireError::OperationCanceled) => break 'action_loop,
+                            Err(InquireError::OperationInterrupted) => std::process::exit(0),
+                            Err(e) => panic!("{}", e),
+                        }
                     };
 
                     if ans4 == "Télécharger" {
@@ -351,7 +473,9 @@ fn main() {
                             episode_numbers.push(format!("Épisode {}", i));
                         }
 
-                        let mut last_ep_idx: usize = 0;
+                        let mut last_ep_idx: usize = history_episode
+                            .map(|e| (e - 1).min(ans3.episodes.len() - 1))
+                            .unwrap_or(0);
                         loop {
                             let ans5 = match Select::new(
                                 "Sélectionnez l'épisode à regarder (Échap pour retour) : ",
@@ -372,7 +496,10 @@ fn main() {
                             if is_otokurikka {
                                 autoclicker::run_episode(ep_idx as u32 + 1);
                             } else {
-                                watch(&ans3.episodes[ep_idx]);
+                                let skip_times = mal_anime_id
+                                    .map(|id| mal::fetch_skip_times(id, ep_idx + 1))
+                                    .unwrap_or_default();
+                                watch(&ans3.episodes[ep_idx], &skip_times);
                             }
 
                             // MAL update after watching
@@ -391,6 +518,10 @@ fn main() {
                                     }
                                 }
                             }
+
+                            // Save watch history
+                            let last_pos = mal::read_last_position();
+                            mal::update_history(&ans, &ans3.lang, ans3.season, ep_idx + 1, last_pos);
                         }
                     }
                 }

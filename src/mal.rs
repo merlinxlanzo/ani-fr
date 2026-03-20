@@ -23,6 +23,21 @@ pub struct MalCache {
     pub mappings: HashMap<String, u64>,
 }
 
+#[derive(Serialize, Deserialize, Clone)]
+pub struct HistoryEntry {
+    pub name: String,
+    pub lang: String,
+    pub season: i8,
+    pub episode: usize,
+    pub timestamp: f64,
+    pub updated_at: i64,
+}
+
+#[derive(Serialize, Deserialize, Default)]
+pub struct WatchHistory {
+    pub entries: Vec<HistoryEntry>,
+}
+
 fn data_dir() -> PathBuf {
     ProjectDirs::from("", "B0SE", "ani-fr")
         .expect("Failed to get project directory")
@@ -389,6 +404,54 @@ pub fn resolve_mal_id(
     Some(*id)
 }
 
+pub struct SkipTime {
+    pub start: f64,
+    pub end: f64,
+    pub skip_type: String,
+}
+
+pub fn fetch_skip_times(mal_id: u64, episode: usize) -> Vec<SkipTime> {
+    let url = format!(
+        "https://api.aniskip.com/v2/skip-times/{}/{}?types=op&types=ed&episodeLength=0",
+        mal_id, episode
+    );
+
+    let client = reqwest::blocking::Client::new();
+    let resp = match client.get(&url).send() {
+        Ok(r) => r,
+        Err(_) => return Vec::new(),
+    };
+
+    let json = match parse_json(resp) {
+        Some(j) => j,
+        None => return Vec::new(),
+    };
+
+    let found = json.get("found").and_then(|v| v.as_bool()).unwrap_or(false);
+    if !found {
+        return Vec::new();
+    }
+
+    let mut skip_times = Vec::new();
+    if let Some(results) = json.get("results").and_then(|v| v.as_array()) {
+        for item in results {
+            let skip_type = item
+                .get("skipType")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            if let Some(interval) = item.get("interval") {
+                let start = interval.get("startTime").and_then(|v| v.as_f64()).unwrap_or(0.0);
+                let end = interval.get("endTime").and_then(|v| v.as_f64()).unwrap_or(0.0);
+                if end > start {
+                    skip_times.push(SkipTime { start, end, skip_type });
+                }
+            }
+        }
+    }
+    skip_times
+}
+
 pub fn update_episode(mal_id: u64, episode: usize, is_completed: bool, config: &MalConfig) {
     let status = if is_completed { "completed" } else { "watching" };
     let ep_str = episode.to_string();
@@ -427,5 +490,78 @@ pub fn update_episode(mal_id: u64, episode: usize, is_completed: bool, config: &
             }
         }
         Err(e) => println!("{} {}", "Erreur MAL:".red(), e),
+    }
+}
+
+fn history_path() -> PathBuf {
+    data_dir().join("watch_history.json")
+}
+
+pub fn load_history() -> WatchHistory {
+    let path = history_path();
+    if let Ok(data) = std::fs::read_to_string(&path) {
+        serde_json::from_str(&data).unwrap_or_default()
+    } else {
+        WatchHistory::default()
+    }
+}
+
+fn save_history(history: &WatchHistory) {
+    let path = history_path();
+    if let Ok(json) = serde_json::to_string_pretty(history) {
+        let _ = std::fs::write(path, json);
+    }
+}
+
+pub fn update_history(name: &str, lang: &str, season: i8, episode: usize, timestamp: f64) {
+    let mut history = load_history();
+
+    // Update existing entry or add new one
+    if let Some(entry) = history.entries.iter_mut().find(|e| e.name == name) {
+        entry.lang = lang.to_string();
+        entry.season = season;
+        entry.episode = episode;
+        entry.timestamp = timestamp;
+        entry.updated_at = Utc::now().timestamp();
+    } else {
+        history.entries.push(HistoryEntry {
+            name: name.to_string(),
+            lang: lang.to_string(),
+            season,
+            episode,
+            timestamp,
+            updated_at: Utc::now().timestamp(),
+        });
+    }
+
+    // Keep only the last 10
+    history.entries.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
+    history.entries.truncate(10);
+
+    save_history(&history);
+}
+
+pub fn last_position_path() -> PathBuf {
+    data_dir().join("last_pos.txt")
+}
+
+pub fn read_last_position() -> f64 {
+    let path = last_position_path();
+    if let Ok(data) = std::fs::read_to_string(&path) {
+        data.trim().parse().unwrap_or(0.0)
+    } else {
+        0.0
+    }
+}
+
+pub fn format_timestamp(seconds: f64) -> String {
+    let total = seconds as u64;
+    let h = total / 3600;
+    let m = (total % 3600) / 60;
+    let s = total % 60;
+    if h > 0 {
+        format!("{:02}:{:02}:{:02}", h, m, s)
+    } else {
+        format!("{:02}:{:02}", m, s)
     }
 }
