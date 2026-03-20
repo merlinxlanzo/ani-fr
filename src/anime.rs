@@ -34,17 +34,34 @@ impl Display for Media {
     }
 }
 
+fn normalize_name(name: &str) -> String {
+    name.to_lowercase()
+        .chars()
+        .filter(|c| c.is_alphanumeric() || *c == ' ')
+        .collect::<String>()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 impl Medias {
     pub fn get_name(&self) -> Vec<String> {
+        let mut seen = std::collections::HashSet::new();
         let mut names = Vec::new();
         for anime in &self.media {
-            if !names.contains(&anime.name) {
+            let norm = normalize_name(&anime.name);
+            if seen.insert(norm) {
                 names.push(anime.name.clone());
             }
         }
         names
     }
     pub fn get_seasons_from_str(&self, name: &str) -> Vec<Media> {
-        self.media.iter().filter(|x| x.name == name).cloned().collect()
+        let norm = normalize_name(name);
+        self.media
+            .iter()
+            .filter(|x| normalize_name(&x.name) == norm)
+            .cloned()
+            .collect()
     }
 }

@@ -36,6 +36,12 @@ LANG_MAP = {
 }
 
 
+def normalize_name(name: str) -> str:
+    """Strip punctuation and extra spaces for consistent matching."""
+    return re.sub(r"[^a-z0-9 ]+", "", name.strip().lower()).strip()
+
+
+
 @dataclass
 class AnimeEntry:
     name: str
@@ -271,10 +277,10 @@ def load_data(path: Path) -> dict:
 
 
 def build_existing_keys(data: dict) -> dict[tuple, int]:
-    """Build a map of (name, lang, season) -> index and episode count."""
+    """Build a map of (normalized_name, lang, season) -> index and episode count."""
     keys: dict[tuple, int] = {}
     for i, entry in enumerate(data.get("media", [])):
-        key = (entry["name"], entry["lang"], entry.get("season", 1))
+        key = (normalize_name(entry["name"]), entry["lang"], entry.get("season", 1))
         keys[key] = len(entry.get("episodes", []))
     return keys
 
@@ -328,81 +334,96 @@ def run(args: argparse.Namespace) -> None:
     seen_names: set[str] = set()
     new_entries: list[dict] = []
 
-    for i, item in enumerate(catalogue):
-        name_lower = item.name.strip().lower()
-        media_type = "film" if "film" in item.media_type.lower() else "anime"
+    last_save_count = 0
 
-        info(f"[{i + 1}/{len(catalogue)}] Processing: {item.name}")
+    def _save_progress():
+        nonlocal last_save_count
+        if len(new_entries) > last_save_count:
+            data["media"].extend(new_entries[last_save_count:])
+            last_save_count = len(new_entries)
+            # Dedup
+            seen_dedup: dict[tuple, int] = {}
+            deduped: list[dict] = []
+            for entry in data["media"]:
+                key = (normalize_name(entry["name"]), entry["lang"], entry.get("season", 1))
+                if key in seen_dedup:
+                    idx = seen_dedup[key]
+                    if len(entry.get("episodes", [])) > len(deduped[idx].get("episodes", [])):
+                        deduped[idx] = entry
+                else:
+                    seen_dedup[key] = len(deduped)
+                    deduped.append(entry)
+            data["media"] = deduped
+            save_data(data, data_path, args.dry_run)
+            info(f"Saved progress ({len(data['media'])} entries)")
 
-        season_lang_pairs = discover_seasons(item.slug, args.delay)
+    try:
+        for i, item in enumerate(catalogue):
+            name_lower = item.name.strip().lower()
+            media_type = "film" if "film" in item.media_type.lower() else "anime"
 
-        for season, lang in season_lang_pairs:
-            key = (name_lower, lang, season)
+            info(f"[{i + 1}/{len(catalogue)}] Processing: {item.name}")
 
-            if key in existing:
-                if not args.check_updates:
+            # Auto-save every 50 new entries to avoid losing progress
+            if len(new_entries) - last_save_count >= 50:
+                _save_progress()
+
+            season_lang_pairs = discover_seasons(item.slug, args.delay)
+
+            for season, lang in season_lang_pairs:
+                key = (normalize_name(item.name), lang, season)
+
+                if key in existing:
+                    if not args.check_updates:
+                        continue
+                    old_count = existing[key]
+                    episodes = fetch_episodes(item.slug, season, lang, args.delay)
+                    if len(episodes) > old_count:
+                        info(
+                            f"  Updated: {name_lower} S{season} {lang}: "
+                            f"{old_count} -> {len(episodes)} episodes"
+                        )
+                        if not args.dry_run:
+                            for entry in data["media"]:
+                                if (normalize_name(entry["name"]), entry["lang"], entry.get("season", 1)) == key:
+                                    entry["episodes"] = episodes
+                                    break
+                        stats["updated"] += 1
+                        stats["new_episodes"] += len(episodes) - old_count
                     continue
-                old_count = existing[key]
+
+                # New entry
                 episodes = fetch_episodes(item.slug, season, lang, args.delay)
-                if len(episodes) > old_count:
-                    info(
-                        f"  Updated: {name_lower} S{season} {lang}: "
-                        f"{old_count} -> {len(episodes)} episodes"
-                    )
-                    if not args.dry_run:
-                        for entry in data["media"]:
-                            if (entry["name"], entry["lang"], entry.get("season", 1)) == key:
-                                entry["episodes"] = episodes
-                                break
-                    stats["updated"] += 1
-                    stats["new_episodes"] += len(episodes) - old_count
-                continue
+                if not episodes:
+                    warn(f"  No episodes found for {name_lower} S{season} {lang}, skipping")
+                    continue
 
-            # New entry
-            episodes = fetch_episodes(item.slug, season, lang, args.delay)
-            if not episodes:
-                warn(f"  No episodes found for {name_lower} S{season} {lang}, skipping")
-                continue
+                entry = AnimeEntry(
+                    name=name_lower,
+                    lang=lang,
+                    media_type=media_type,
+                    season=season,
+                    episodes=episodes,
+                )
 
-            entry = AnimeEntry(
-                name=name_lower,
-                lang=lang,
-                media_type=media_type,
-                season=season,
-                episodes=episodes,
-            )
+                new_entries.append(entry.to_dict())
+                existing[key] = len(episodes)
 
-            new_entries.append(entry.to_dict())
-            existing[key] = len(episodes)
+                if name_lower not in seen_names:
+                    stats["new_animes"] += 1
+                    seen_names.add(name_lower)
 
-            if name_lower not in seen_names:
-                stats["new_animes"] += 1
-                seen_names.add(name_lower)
-
-            stats["new_seasons"] += 1
-            stats["new_episodes"] += len(episodes)
-            success(
-                f"  New: {name_lower} S{season} {lang} - {len(episodes)} episodes"
-            )
+                stats["new_seasons"] += 1
+                stats["new_episodes"] += len(episodes)
+                success(
+                    f"  New: {name_lower} S{season} {lang} - {len(episodes)} episodes"
+                )
+    except KeyboardInterrupt:
+        warn("Interrupted! Saving progress...")
+        _save_progress()
 
     # Merge, dedup, and save
-    if new_entries or stats["updated"]:
-        data["media"].extend(new_entries)
-
-        seen: dict[tuple, int] = {}
-        deduped: list[dict] = []
-        for entry in data["media"]:
-            key = (entry["name"].strip().lower(), entry["lang"], entry.get("season", 1))
-            if key in seen:
-                idx = seen[key]
-                if len(entry.get("episodes", [])) > len(deduped[idx].get("episodes", [])):
-                    deduped[idx] = entry
-            else:
-                seen[key] = len(deduped)
-                deduped.append(entry)
-        data["media"] = deduped
-
-        save_data(data, data_path, args.dry_run)
+    _save_progress()
 
     # Summary
     print()

@@ -34,7 +34,7 @@ fn merge_data(local_path: &Path, remote_bytes: &[u8]) {
     if let Some(local_entries) = local_media {
         for entry in local_entries {
             let key = (
-                entry.get("name").and_then(|v| v.as_str()).unwrap_or("").to_lowercase(),
+                entry.get("name").and_then(|v| v.as_str()).unwrap_or("").to_lowercase().chars().filter(|c| c.is_alphanumeric() || *c == ' ').collect::<String>(),
                 entry.get("lang").and_then(|v| v.as_str()).unwrap_or("").to_string(),
                 entry.get("season").and_then(|v| v.as_i64()).unwrap_or(1),
             );
@@ -47,7 +47,7 @@ fn merge_data(local_path: &Path, remote_bytes: &[u8]) {
     if let Some(remote_entries) = remote_media {
         for entry in remote_entries {
             let key = (
-                entry.get("name").and_then(|v| v.as_str()).unwrap_or("").to_lowercase(),
+                entry.get("name").and_then(|v| v.as_str()).unwrap_or("").to_lowercase().chars().filter(|c| c.is_alphanumeric() || *c == ' ').collect::<String>(),
                 entry.get("lang").and_then(|v| v.as_str()).unwrap_or("").to_string(),
                 entry.get("season").and_then(|v| v.as_i64()).unwrap_or(1),
             );
