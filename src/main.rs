@@ -225,12 +225,22 @@ end)
         ));
     }
 
-    // Save position on quit
     lua.push_str(&format!(
-        r#"mp.register_event("shutdown", function()
+        r#"local last_saved_pos = 0
+mp.observe_property("time-pos", "number", function(_, pos)
+    if pos and math.abs(pos - last_saved_pos) >= 5 then
+        last_saved_pos = pos
+        local f = io.open("{pos}", "w")
+        if f then
+            f:write(string.format("%.3f", pos))
+            f:close()
+        end
+    end
+end)
+mp.register_event("shutdown", function()
     local pos = mp.get_property_number("time-pos")
     if pos then
-        local f = io.open("{}", "w")
+        local f = io.open("{pos}", "w")
         if f then
             f:write(string.format("%.3f", pos))
             f:close()
@@ -238,7 +248,7 @@ end)
     end
 end)
 "#,
-        pos_file_escaped
+        pos = pos_file_escaped
     ));
 
     let dir = directories::ProjectDirs::from("", "B0SE", "ani-fr")
@@ -251,7 +261,7 @@ end)
     }
 }
 
-fn watch(link: &str, skip_times: &[mal::SkipTime], auto_next: bool) -> bool {
+fn watch(link: &str, skip_times: &[mal::SkipTime], auto_next: bool, start_pos: Option<f64>) -> bool {
     // Clear old signals
     let _ = std::fs::remove_file(mal::last_position_path());
     let _ = std::fs::remove_file(next_episode_signal_path());
@@ -263,6 +273,9 @@ fn watch(link: &str, skip_times: &[mal::SkipTime], auto_next: bool) -> bool {
         cmd.arg("--ytdl-format=bestvideo[height<=1080]+bestaudio/best[height<=1080]/best");
         if let Some(ref sp) = script_path {
             cmd.arg(format!("--script={}", sp.display()));
+        }
+        if let Some(pos) = start_pos {
+            cmd.arg(format!("--start={:.3}", pos));
         }
         cmd.arg(link);
         if is_debug() {
@@ -381,11 +394,15 @@ fn main() {
         let mut history_episode: Option<usize> = None;
         let mut history_lang: Option<String> = None;
         let mut history_season: Option<i8> = None;
+        let mut history_timestamp: Option<f64> = None;
         let ans = if let Some(hist_entry) = history_labels.iter().position(|l| *l == ans) {
             let entry = &history.entries[hist_entry];
             history_episode = Some(entry.episode);
             history_lang = Some(entry.lang.clone());
             history_season = Some(entry.season);
+            if entry.timestamp > 0.0 {
+                history_timestamp = Some(entry.timestamp);
+            }
             entry.name.clone()
         } else {
             ans
@@ -598,7 +615,8 @@ fn main() {
                                         eprintln!("[DEBUG] No skip times found");
                                     }
                                 }
-                                let auto_next = watch(ep_url, &skip_times, has_next);
+                                let resume_pos = history_timestamp.take();
+                                let auto_next = watch(ep_url, &skip_times, has_next, resume_pos);
 
                                 // MAL update after watching
                                 if let Some(mal_id) = mal_anime_id {
