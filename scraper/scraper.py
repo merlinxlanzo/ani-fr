@@ -246,8 +246,17 @@ def fetch_episodes(slug: str, season: int, lang: str, delay: float) -> list[str]
     all_sources: list[list[str]] = []
     sibnet_source: list[str] = []
 
+    def _is_valid_url(u: str) -> bool:
+        """Filter out template URLs with missing IDs."""
+        if u.endswith("=") or u.endswith("embed-.html") or u.endswith("/embed/"):
+            return False
+        if len(u) <= 10:
+            return False
+        return True
+
     for m in re.finditer(r"(?:var\s+)?(eps\w+)\s*=\s*\[([^\]]*)\]", js_text):
         urls = re.findall(r"""['"]([^'"]+)['"]""", m.group(2))
+        urls = [u for u in urls if _is_valid_url(u)]
         if not urls:
             continue
         all_sources.append(urls)
@@ -257,7 +266,7 @@ def fetch_episodes(slug: str, season: int, lang: str, delay: float) -> list[str]
     if sibnet_source:
         return sibnet_source
     if all_sources:
-        return all_sources[0]
+        return max(all_sources, key=len)
 
     warn(f"No episode URLs found in {url}")
     return []
@@ -332,8 +341,17 @@ def run(args: argparse.Namespace) -> None:
     catalogue = scrape_catalogue(args.pages, args.delay)
     info(f"Found {len(catalogue)} anime(s)/film(s) in catalogue")
 
-    # Filter out already fully scraped animes (unless checking for updates)
-    if not args.check_updates:
+    # Filter by name if specified
+    if args.name:
+        search = normalize_name(args.name)
+        catalogue = [item for item in catalogue if search in normalize_name(item.name)]
+        if not catalogue:
+            error(f"No anime found matching '{args.name}'")
+            return
+        info(f"Matched {len(catalogue)} anime(s): {', '.join(item.name for item in catalogue)}")
+
+    # Filter out already fully scraped animes (unless checking for updates or targeting by name)
+    if not args.check_updates and not args.name:
         before = len(catalogue)
         catalogue = [item for item in catalogue if normalize_name(item.name) not in known_names]
         skipped = before - len(catalogue)
@@ -414,7 +432,10 @@ def run(args: argparse.Namespace) -> None:
                     continue
 
                 # Skip phantom seasons (1 episode likely means a bad entry)
-                if len(episodes) == 1 and season > 1 and media_type != "film":
+                # But only if the previous season also had few episodes (truly phantom)
+                prev_key = (normalize_name(item.name), lang, season - 1)
+                prev_count = existing.get(prev_key, 0)
+                if len(episodes) == 1 and season > 1 and media_type != "film" and prev_count <= 1:
                     warn(f"  Skipping {name_lower} S{season} {lang} (only 1 episode, likely phantom)")
                     consecutive_fails += 1
                     if consecutive_fails >= 2:
@@ -452,6 +473,28 @@ def run(args: argparse.Namespace) -> None:
 
     # Merge, dedup, and save
     _save_progress()
+
+    # Merge anime-sama "saisons" into single seasons per anime+lang
+    # anime-sama splits episodes into batches (saison1=eps 1-10, saison2=eps 11+, etc.)
+    merged: dict[tuple[str, str], dict] = {}
+    non_mergeable: list[dict] = []
+    for entry in data["media"]:
+        if entry.get("media_type") == "film":
+            non_mergeable.append(entry)
+            continue
+        key = (normalize_name(entry["name"]), entry["lang"])
+        if key not in merged:
+            merged[key] = {
+                "name": entry["name"],
+                "lang": entry["lang"],
+                "media_type": entry["media_type"],
+                "season": 1,
+                "episodes": list(entry.get("episodes", [])),
+            }
+        else:
+            merged[key]["episodes"].extend(entry.get("episodes", []))
+    data["media"] = list(merged.values()) + non_mergeable
+    save_data(data, data_path, args.dry_run)
 
     # Summary
     print()
@@ -497,6 +540,12 @@ def main() -> None:
         type=int,
         default=None,
         help="Limit number of catalogue pages to scrape (default: all)",
+    )
+    parser.add_argument(
+        "--name",
+        type=str,
+        default=None,
+        help="Scrape a specific anime by name (searches the catalogue)",
     )
 
     args = parser.parse_args()

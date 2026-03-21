@@ -6,12 +6,20 @@ use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use inquire::*;
 use spinners::{Spinner, Spinners};
 use std::{
+    env,
     fs,
     io::{BufRead, BufReader},
     path::Path,
     process::{Command, Stdio},
+    sync::atomic::{AtomicBool, Ordering},
 };
 use threadpool::ThreadPool;
+
+static DEBUG: AtomicBool = AtomicBool::new(false);
+
+fn is_debug() -> bool {
+    DEBUG.load(Ordering::Relaxed)
+}
 
 mod anime;
 mod autoclicker;
@@ -143,9 +151,20 @@ fn extract_speed(line: &str) -> Option<&str> {
     Some(line[at..eta].trim())
 }
 
-fn write_mpv_script(skip_times: &[mal::SkipTime]) -> Option<std::path::PathBuf> {
+fn next_episode_signal_path() -> std::path::PathBuf {
+    directories::ProjectDirs::from("", "B0SE", "ani-fr")
+        .expect("Failed to get project directory")
+        .data_dir()
+        .join("next_episode.signal")
+}
+
+fn write_mpv_script(skip_times: &[mal::SkipTime], auto_next: bool) -> Option<std::path::PathBuf> {
     let pos_file = mal::last_position_path();
     let pos_file_escaped = pos_file.display().to_string().replace('\\', "\\\\");
+    let signal_file_escaped = next_episode_signal_path()
+        .display()
+        .to_string()
+        .replace('\\', "\\\\");
 
     let mut lua = String::new();
 
@@ -159,21 +178,51 @@ fn write_mpv_script(skip_times: &[mal::SkipTime]) -> Option<std::path::PathBuf> 
             ));
         }
         lua.push_str("}\n");
-        lua.push_str(
-            r#"local skipped = {}
+        lua.push_str(&format!(
+            r#"local skipped = {{}}
+local auto_next = {}
 mp.observe_property("time-pos", "number", function(_, pos)
     if pos then
         for i, s in ipairs(skips) do
             if not skipped[i] and pos >= s.start and pos < s.ends then
+                skipped[i] = true
+                if string.lower(s.type) == "ed" and auto_next then
+                    mp.osd_message("Épisode suivant...", 2)
+                    local f = io.open("{}", "w")
+                    if f then
+                        f:write("next")
+                        f:close()
+                    end
+                    mp.command("quit")
+                    return
+                end
                 mp.commandv("seek", tostring(s.ends), "absolute")
                 mp.osd_message("Skip " .. string.upper(s.type), 2)
-                skipped[i] = true
             end
         end
     end
 end)
 "#,
-        );
+            if auto_next { "true" } else { "false" },
+            signal_file_escaped
+        ));
+    }
+
+    // Auto-next when episode finishes naturally (EOF)
+    if auto_next {
+        lua.push_str(&format!(
+            r#"mp.register_event("end-file", function(event)
+    if event.reason == "eof" then
+        local f = io.open("{}", "w")
+        if f then
+            f:write("next")
+            f:close()
+        end
+    end
+end)
+"#,
+            signal_file_escaped
+        ));
     }
 
     // Save position on quit
@@ -202,11 +251,12 @@ end)
     }
 }
 
-fn watch(link: &str, skip_times: &[mal::SkipTime]) {
-    // Clear old position
+fn watch(link: &str, skip_times: &[mal::SkipTime], auto_next: bool) -> bool {
+    // Clear old signals
     let _ = std::fs::remove_file(mal::last_position_path());
+    let _ = std::fs::remove_file(next_episode_signal_path());
 
-    let script_path = write_mpv_script(skip_times);
+    let script_path = write_mpv_script(skip_times, auto_next);
     let mpv_paths = ["mpv", "C:\\Program Files\\MPV Player\\mpv.exe"];
     for path in mpv_paths {
         let mut cmd = std::process::Command::new(path);
@@ -215,9 +265,29 @@ fn watch(link: &str, skip_times: &[mal::SkipTime]) {
             cmd.arg(format!("--script={}", sp.display()));
         }
         cmd.arg(link);
+        if is_debug() {
+            cmd.stderr(Stdio::piped());
+        }
         if let Ok(mut child) = cmd.spawn() {
-            let _ = child.wait();
-            return;
+            let status = child.wait();
+            if is_debug() {
+                if let Some(stderr) = child.stderr.take() {
+                    let err_output: String = BufReader::new(stderr)
+                        .lines()
+                        .filter_map(|l| l.ok())
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                    if !err_output.is_empty() {
+                        eprintln!("{}", err_output);
+                    }
+                }
+                if let Ok(s) = &status {
+                    if !s.success() {
+                        eprintln!("{}", format!("mpv exited with: {}", s).red());
+                    }
+                }
+            }
+            return next_episode_signal_path().exists();
         }
     }
     #[cfg(target_os = "windows")]
@@ -226,9 +296,15 @@ fn watch(link: &str, skip_times: &[mal::SkipTime]) {
     let _ = std::process::Command::new("xdg-open").arg(link).spawn();
     #[cfg(target_os = "macos")]
     let _ = std::process::Command::new("open").arg(link).spawn();
+    false
 }
 
 fn main() {
+    if env::args().any(|a| a == "--debug") {
+        DEBUG.store(true, Ordering::Relaxed);
+        eprintln!("{}", "[DEBUG MODE]".yellow());
+    }
+
     let file_path = ProjectDirs::from("", "B0SE", "ani-fr")
         .expect("Failed to get project directory")
         .data_dir()
@@ -501,35 +577,64 @@ fn main() {
                             let ep_idx = ans5.replace("Épisode ", "").parse::<usize>().unwrap() - 1;
                             last_ep_idx = ep_idx;
 
-                            if is_otokurikka {
-                                autoclicker::run_episode(ep_idx as u32 + 1);
-                            } else {
-                                let skip_times = mal_anime_id
-                                    .map(|id| mal::fetch_skip_times(id, ep_idx + 1))
-                                    .unwrap_or_default();
-                                watch(&ans3.episodes[ep_idx], &skip_times);
-                            }
+                            let mut current_ep = ep_idx;
+                            loop {
+                                if is_otokurikka {
+                                    autoclicker::run_episode(current_ep as u32 + 1);
+                                    break;
+                                }
 
-                            // MAL update after watching
-                            if let Some(mal_id) = mal_anime_id {
-                                if let Some(mut mal_config) = mal::load_config() {
-                                    if mal::ensure_token(&mut mal_config) {
-                                        let is_completed = ep_idx == ans3.episodes.len() - 1
-                                            && ans3.season
-                                                == animes3.last().unwrap().season;
-                                        mal::update_episode(
-                                            mal_id,
-                                            ep_idx + 1,
-                                            is_completed,
-                                            &mal_config,
-                                        );
+                                let has_next = current_ep + 1 < ans3.episodes.len();
+                                let skip_times = mal_anime_id
+                                    .map(|id| mal::fetch_skip_times(id, current_ep + 1))
+                                    .unwrap_or_default();
+                                let ep_url = &ans3.episodes[current_ep];
+                                if is_debug() {
+                                    eprintln!("[DEBUG] Episode URL: {}", ep_url);
+                                    for st in &skip_times {
+                                        eprintln!("[DEBUG] Skip: type={} start={:.1} end={:.1}", st.skip_type, st.start, st.end);
+                                    }
+                                    if skip_times.is_empty() {
+                                        eprintln!("[DEBUG] No skip times found");
                                     }
                                 }
-                            }
+                                let auto_next = watch(ep_url, &skip_times, has_next);
 
-                            // Save watch history
-                            let last_pos = mal::read_last_position();
-                            mal::update_history(&ans, &ans3.lang, ans3.season, ep_idx + 1, last_pos);
+                                // MAL update after watching
+                                if let Some(mal_id) = mal_anime_id {
+                                    if let Some(mut mal_config) = mal::load_config() {
+                                        if mal::ensure_token(&mut mal_config) {
+                                            let is_completed = current_ep == ans3.episodes.len() - 1
+                                                && ans3.season
+                                                    == animes3.last().unwrap().season;
+                                            mal::update_episode(
+                                                mal_id,
+                                                current_ep + 1,
+                                                is_completed,
+                                                &mal_config,
+                                            );
+                                        }
+                                    }
+                                }
+
+                                // Save watch history
+                                let last_pos = mal::read_last_position();
+                                mal::update_history(&ans, &ans3.lang, ans3.season, current_ep + 1, last_pos);
+
+                                // Auto-advance to next episode if ED was skipped
+                                if auto_next && has_next {
+                                    current_ep += 1;
+                                    last_ep_idx = current_ep;
+                                    println!(
+                                        "{}",
+                                        format!("▶ Épisode {} automatique...", current_ep + 1).cyan()
+                                    );
+                                    let _ = std::fs::remove_file(next_episode_signal_path());
+                                } else {
+                                    last_ep_idx = current_ep;
+                                    break;
+                                }
+                            }
                         }
                     }
                 }
