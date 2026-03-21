@@ -354,7 +354,7 @@ fn main() {
         let mut history_labels: Vec<String> = Vec::new();
         if !history.entries.is_empty() {
             all_anime_names.push("─── Récemment regardés ───".to_string());
-            for entry in &history.entries {
+            for entry in history.entries.iter().take(3) {
                 let label = format!(
                     "↪ {} - Ép.{} ({})",
                     entry.name,
@@ -386,11 +386,41 @@ fn main() {
         };
 
         // Skip separators
-        if ans == "─── Récemment regardés ───" || ans == "───────────────────────" {
+        if ans == "───────────────────────" {
             continue 'main_loop;
         }
 
-        // Handle history selection — extract real anime name, lang, season, episode
+        let ans = if ans == "─── Récemment regardés ───" {
+            let full_history_labels: Vec<String> = history
+                .entries
+                .iter()
+                .map(|e| {
+                    format!(
+                        "↪ {} - Ép.{} ({})",
+                        e.name,
+                        e.episode,
+                        mal::format_timestamp(e.timestamp)
+                    )
+                })
+                .collect();
+
+            match Select::new(
+                "Historique complet (Échap pour retour) : ",
+                full_history_labels.clone(),
+            )
+            .prompt()
+            {
+                Ok(selected) => {
+                    history_labels = full_history_labels;
+                    selected
+                }
+                Err(_) => continue 'main_loop,
+            }
+        } else {
+            ans
+        };
+
+
         let mut history_episode: Option<usize> = None;
         let mut history_lang: Option<String> = None;
         let mut history_season: Option<i8> = None;
@@ -518,6 +548,7 @@ fn main() {
                 };
 
                 'action_loop: loop {
+                    let mut skip_episode_select = used_history_shortcut;
                     let ans4 = if used_history_shortcut {
                         used_history_shortcut = false;
                         "Regarder"
@@ -578,20 +609,24 @@ fn main() {
                             .map(|e| (e - 1).min(ans3.episodes.len() - 1))
                             .unwrap_or(0);
                         loop {
-                            let ans5 = match Select::new(
-                                "Sélectionnez l'épisode à regarder (Échap pour retour) : ",
-                                episode_numbers.clone(),
-                            )
-                            .with_starting_cursor(last_ep_idx)
-                            .prompt()
-                            {
-                                Ok(v) => v,
-                                Err(InquireError::OperationCanceled) => break,
-                                Err(InquireError::OperationInterrupted) => std::process::exit(0),
-                                Err(e) => panic!("{}", e),
+                            let ep_idx = if skip_episode_select {
+                                skip_episode_select = false;
+                                last_ep_idx
+                            } else {
+                                let ans5 = match Select::new(
+                                    "Sélectionnez l'épisode à regarder (Échap pour retour) : ",
+                                    episode_numbers.clone(),
+                                )
+                                .with_starting_cursor(last_ep_idx)
+                                .prompt()
+                                {
+                                    Ok(v) => v,
+                                    Err(InquireError::OperationCanceled) => break,
+                                    Err(InquireError::OperationInterrupted) => std::process::exit(0),
+                                    Err(e) => panic!("{}", e),
+                                };
+                                ans5.replace("Épisode ", "").parse::<usize>().unwrap() - 1
                             };
-
-                            let ep_idx = ans5.replace("Épisode ", "").parse::<usize>().unwrap() - 1;
                             last_ep_idx = ep_idx;
 
                             let mut current_ep = ep_idx;

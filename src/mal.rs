@@ -534,9 +534,8 @@ pub fn update_history(name: &str, lang: &str, season: i8, episode: usize, timest
         });
     }
 
-    // Keep only the last 10
     history.entries.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
-    history.entries.truncate(10);
+    history.entries.truncate(50);
 
     save_history(&history);
 }
