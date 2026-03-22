@@ -1,6 +1,8 @@
 use directories::ProjectDirs;
 use std::io;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
+use std::thread;
 
 const ANIME_DATA_URL: &str =
     "https://raw.githubusercontent.com/frivoxfr/ani-data/refs/heads/main/anime_data.json";
@@ -62,14 +64,46 @@ fn merge_data(local_path: &Path, remote_bytes: &[u8]) {
     serde_json::to_writer(out, &result).expect("Failed to write merged data");
 }
 
-pub fn get_file(overwrite: bool) {
+/// Returns the path to the data file, ensuring the directory exists.
+pub fn data_file_path() -> PathBuf {
     let dir = ProjectDirs::from("", "B0SE", "ani-fr").expect("Failed to get project directory");
     let data_dir = dir.data_dir();
-    let file_path = data_dir.join("anime_data.json");
-
     if !data_dir.exists() {
         std::fs::create_dir_all(data_dir).expect("Failed to create data directory");
     }
+    data_dir.join("anime_data.json")
+}
+
+/// Downloads the remote data file if no local file exists. Returns true if
+/// data was freshly downloaded (caller should re-read the file).
+pub fn ensure_local_data(file_path: &Path) -> bool {
+    if file_path.exists() {
+        return false;
+    }
+    if let Some(bytes) = download_to_vec() {
+        let mut out = std::fs::File::create(file_path).expect("Failed to create file");
+        io::copy(&mut bytes.as_slice(), &mut out).expect("Failed to write to file");
+        return true;
+    }
+    false
+}
+
+/// Spawns a background thread that downloads remote data and merges it.
+/// Returns a handle that can be used to wait for completion.
+pub fn sync_remote_in_background(file_path: PathBuf) -> Arc<Mutex<bool>> {
+    let done = Arc::new(Mutex::new(false));
+    let done_clone = done.clone();
+    thread::spawn(move || {
+        if let Some(remote_bytes) = download_to_vec() {
+            merge_data(&file_path, &remote_bytes);
+        }
+        *done_clone.lock().unwrap() = true;
+    });
+    done
+}
+
+pub fn get_file(overwrite: bool) {
+    let file_path = data_file_path();
 
     if !file_path.exists() || overwrite {
         if let Some(bytes) = download_to_vec() {

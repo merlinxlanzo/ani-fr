@@ -51,6 +51,8 @@ impl Display for Media {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         if self.media_type == "film" {
             write!(f, "{}", "film".yellow())
+        } else if self.media_type == "oav" {
+            write!(f, "{}", "OAV".yellow())
         } else {
             write!(f, "saison {}", self.season.to_string().yellow())
         }

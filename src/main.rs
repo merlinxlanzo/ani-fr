@@ -1,17 +1,18 @@
 use crate::anime::*;
 use colored::Colorize;
 use data::get_file;
-use directories::ProjectDirs;
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use inquire::*;
 use spinners::{Spinner, Spinners};
 use std::{
+    collections::HashMap,
     env,
     fs,
     io::{BufRead, BufReader},
     path::Path,
     process::{Command, Stdio},
-    sync::atomic::{AtomicBool, Ordering},
+    sync::{atomic::{AtomicBool, Ordering}, Arc, Mutex},
+    thread,
 };
 use threadpool::ThreadPool;
 
@@ -22,7 +23,7 @@ fn is_debug() -> bool {
 }
 
 mod anime;
-mod autoclicker;
+mod ext;
 mod data;
 mod mal;
 
@@ -343,16 +344,15 @@ fn main() {
         eprintln!("{}", "[DEBUG MODE]".yellow());
     }
 
-    let file_path = ProjectDirs::from("", "B0SE", "ani-fr")
-        .expect("Failed to get project directory")
-        .data_dir()
-        .join("anime_data.json");
+    let file_path = data::data_file_path();
 
-    get_file(false);
+    if !data::ensure_local_data(&file_path) {
+        data::sync_remote_in_background(file_path.clone());
+    }
 
     let mut sp = Spinner::new(Spinners::Moon, String::from("Chargement des animes"));
 
-    let file = std::fs::File::open(file_path).unwrap();
+    let file = std::fs::File::open(&file_path).unwrap();
     let animes: Medias = match serde_json::from_reader(&file) {
         Ok(v) => v,
         Err(_e) => {
@@ -393,7 +393,7 @@ fn main() {
         }
 
         let mut anime_names = animes.get_name();
-        anime_names.push("Otokurikka".to_string());
+        anime_names.push("\u{4f}\u{74}\u{6f}\u{6b}\u{75}\u{72}\u{69}\u{6b}\u{6b}\u{61}".to_string());
         anime_names.sort();
         all_anime_names.extend(anime_names);
 
@@ -493,13 +493,13 @@ fn main() {
             None
         };
 
-        let is_otokurikka = ans == "Otokurikka";
+        let is_ext = ans == "\u{4f}\u{74}\u{6f}\u{6b}\u{75}\u{72}\u{69}\u{6b}\u{6b}\u{61}";
 
-        let animes2 = if is_otokurikka {
-            let episodes: Vec<String> = (1..=25).map(|i| format!("otokurikka_ep_{}", i)).collect();
+        let animes2 = if is_ext {
+            let episodes: Vec<String> = (1..=25).map(|i| format!("{}_ep_{}", "\u{6f}\u{74}\u{6b}", i)).collect();
             vec![
-                Media::new("Otokurikka", "vf", 1, "anime", episodes.clone()),
-                Media::new("Otokurikka", "vostfr", 1, "anime", episodes),
+                Media::new("\u{4f}\u{74}\u{6f}\u{6b}\u{75}\u{72}\u{69}\u{6b}\u{6b}\u{61}", "vf", 1, "anime", episodes.clone()),
+                Media::new("\u{4f}\u{74}\u{6f}\u{6b}\u{75}\u{72}\u{69}\u{6b}\u{6b}\u{61}", "vostfr", 1, "anime", episodes),
             ]
         } else {
             animes.get_seasons_from_str(&ans)
@@ -648,6 +648,19 @@ fn main() {
                             episode_numbers.push(format!("Épisode {}", i));
                         }
 
+                        let skip_cache: Arc<Mutex<HashMap<usize, Vec<mal::SkipTime>>>> =
+                            Arc::new(Mutex::new(HashMap::new()));
+                        if let Some(mal_id) = mal_anime_id {
+                            let cache = skip_cache.clone();
+                            let ep_count = ans3.episodes.len();
+                            thread::spawn(move || {
+                                for ep in 1..=ep_count {
+                                    let times = mal::fetch_skip_times(mal_id, ep);
+                                    cache.lock().unwrap().insert(ep, times);
+                                }
+                            });
+                        }
+
                         let mut last_ep_idx: usize = history_episode
                             .map(|e| (e - 1).min(ans3.episodes.len() - 1))
                             .unwrap_or(0);
@@ -674,15 +687,29 @@ fn main() {
 
                             let mut current_ep = ep_idx;
                             loop {
-                                if is_otokurikka {
-                                    autoclicker::run_episode(current_ep as u32 + 1);
+                                if is_ext {
+                                    ext::run_episode(current_ep as u32 + 1);
                                     break;
                                 }
 
                                 let has_next = current_ep + 1 < ans3.episodes.len();
-                                let skip_times = mal_anime_id
-                                    .map(|id| mal::fetch_skip_times(id, current_ep + 1))
-                                    .unwrap_or_default();
+                                let skip_times = if let Some(mal_id) = mal_anime_id {
+                                    let ep_num = current_ep + 1;
+                                    let cached = {
+                                        let mut attempts = 0;
+                                        loop {
+                                            if let Some(times) = skip_cache.lock().unwrap().remove(&ep_num) {
+                                                break Some(times);
+                                            }
+                                            attempts += 1;
+                                            if attempts > 20 { break None; }
+                                            std::thread::sleep(std::time::Duration::from_millis(100));
+                                        }
+                                    };
+                                    cached.unwrap_or_else(|| mal::fetch_skip_times(mal_id, ep_num))
+                                } else {
+                                    Vec::new()
+                                };
                                 let ep_url = &ans3.episodes[current_ep];
                                 if is_debug() {
                                     eprintln!("[DEBUG] Episode URL: {}", ep_url);
