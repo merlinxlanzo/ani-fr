@@ -151,6 +151,13 @@ fn extract_speed(line: &str) -> Option<&str> {
     Some(line[at..eta].trim())
 }
 
+fn fullscreen_state_path() -> std::path::PathBuf {
+    directories::ProjectDirs::from("", "B0SE", "ani-fr")
+        .expect("Failed to get project directory")
+        .data_dir()
+        .join("fs_state.txt")
+}
+
 fn next_episode_signal_path() -> std::path::PathBuf {
     directories::ProjectDirs::from("", "B0SE", "ani-fr")
         .expect("Failed to get project directory")
@@ -246,9 +253,16 @@ mp.register_event("shutdown", function()
             f:close()
         end
     end
+    local fs = mp.get_property_bool("fullscreen")
+    local f = io.open("{fs}", "w")
+    if f then
+        f:write(fs and "1" or "0")
+        f:close()
+    end
 end)
 "#,
-        pos = pos_file_escaped
+        pos = pos_file_escaped,
+        fs = fullscreen_state_path().display().to_string().replace('\\', "\\\\")
     ));
 
     let dir = directories::ProjectDirs::from("", "B0SE", "ani-fr")
@@ -261,16 +275,27 @@ end)
     }
 }
 
+fn was_fullscreen() -> bool {
+    std::fs::read_to_string(fullscreen_state_path())
+        .map(|s| s.trim() == "1")
+        .unwrap_or(false)
+}
+
 fn watch(link: &str, skip_times: &[mal::SkipTime], auto_next: bool, start_pos: Option<f64>) -> bool {
+    let restore_fs = was_fullscreen();
     // Clear old signals
     let _ = std::fs::remove_file(mal::last_position_path());
     let _ = std::fs::remove_file(next_episode_signal_path());
+    let _ = std::fs::remove_file(fullscreen_state_path());
 
     let script_path = write_mpv_script(skip_times, auto_next);
     let mpv_paths = ["mpv", "C:\\Program Files\\MPV Player\\mpv.exe"];
     for path in mpv_paths {
         let mut cmd = std::process::Command::new(path);
         cmd.arg("--ytdl-format=bestvideo[height<=1080]+bestaudio/best[height<=1080]/best");
+        if restore_fs {
+            cmd.arg("--fs");
+        }
         if let Some(ref sp) = script_path {
             cmd.arg(format!("--script={}", sp.display()));
         }
@@ -515,6 +540,8 @@ fn main() {
                 continue 'lang_loop;
             }
 
+            let can_change_lang = vf && !from_history;
+
             // Sort: seasons first (by number), then films
             animes3.sort_by(|a, b| {
                 let a_is_film = a.media_type == "film";
@@ -541,7 +568,13 @@ fn main() {
                     .prompt()
                     {
                         Ok(v) => v,
-                        Err(InquireError::OperationCanceled) => break 'season_loop,
+                        Err(InquireError::OperationCanceled) => {
+                            if can_change_lang {
+                                break 'season_loop;
+                            } else {
+                                break 'lang_loop;
+                            }
+                        }
                         Err(InquireError::OperationInterrupted) => std::process::exit(0),
                         Err(e) => panic!("{}", e),
                     }
@@ -562,7 +595,17 @@ fn main() {
                         .prompt()
                         {
                             Ok(v) => v,
-                            Err(InquireError::OperationCanceled) => break 'action_loop,
+                            Err(InquireError::OperationCanceled) => {
+                                if animes3.len() == 1 {
+                                    if can_change_lang {
+                                        break 'season_loop;
+                                    } else {
+                                        break 'lang_loop;
+                                    }
+                                } else {
+                                    break 'action_loop;
+                                }
+                            }
                             Err(InquireError::OperationInterrupted) => std::process::exit(0),
                             Err(e) => panic!("{}", e),
                         }

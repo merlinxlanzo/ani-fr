@@ -2,6 +2,24 @@ use colored::*;
 use serde::{Deserialize, Serialize};
 use std::fmt::{Display, Formatter};
 
+fn dedup_consecutive(episodes: Vec<String>) -> Vec<String> {
+    let mut deduped = Vec::with_capacity(episodes.len());
+    for ep in episodes {
+        if deduped.last() != Some(&ep) {
+            deduped.push(ep);
+        }
+    }
+    deduped
+}
+
+fn deserialize_episodes<'de, D>(deserializer: D) -> Result<Vec<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let episodes: Vec<String> = Vec::deserialize(deserializer)?;
+    Ok(dedup_consecutive(episodes))
+}
+
 #[derive(Serialize, Deserialize, Debug)]
 pub struct Medias {
     pub media: Vec<Media>,
@@ -13,6 +31,7 @@ pub struct Media {
     pub lang: String,
     pub season: i8,
     pub media_type: String,
+    #[serde(deserialize_with = "deserialize_episodes")]
     pub episodes: Vec<String>,
 }
 
@@ -23,7 +42,7 @@ impl Media {
             lang: lang.to_string(),
             season,
             media_type: media_type.to_string(),
-            episodes,
+            episodes: dedup_consecutive(episodes),
         }
     }
 }
