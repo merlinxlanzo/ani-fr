@@ -367,6 +367,77 @@ fn auto_search(name: &str, config: &MalConfig) -> Vec<(u64, String)> {
     Vec::new()
 }
 
+fn search_jikan(query: &str) -> Vec<(u64, String)> {
+    let url = format!(
+        "https://api.jikan.moe/v4/anime?q={}&limit=10&order_by=members&sort=desc",
+        urlencoded(query)
+    );
+
+    let client = reqwest::blocking::Client::new();
+    let resp = match client.get(&url).send() {
+        Ok(r) => r,
+        Err(_) => return Vec::new(),
+    };
+
+    let mut results = Vec::new();
+    if let Some(json) = parse_json(resp) {
+        if let Some(data) = json.get("data").and_then(|d| d.as_array()) {
+            for item in data {
+                let id = item.get("mal_id").and_then(|v| v.as_u64()).unwrap_or(0);
+                let title = item
+                    .get("title")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("?")
+                    .to_string();
+                if id > 0 {
+                    results.push((id, title));
+                }
+            }
+        }
+    }
+    results
+}
+
+fn auto_search_public(name: &str) -> Vec<(u64, String)> {
+    let words: Vec<&str> = name.split_whitespace().collect();
+    let attempts: Vec<String> = {
+        let mut a = vec![name.to_string()];
+        for &n in &[7, 5, 3] {
+            if words.len() > n {
+                a.push(words[..n].join(" "));
+            }
+        }
+        a
+    };
+
+    for query in &attempts {
+        let results = search_jikan(query);
+        if !results.is_empty() {
+            return results;
+        }
+    }
+    Vec::new()
+}
+
+pub fn resolve_mal_id_public(french_name: &str, cache: &mut MalCache) -> Option<u64> {
+    if let Some(&id) = cache.mappings.get(french_name) {
+        return Some(id);
+    }
+
+    println!("Recherche AniSkip : {}...", french_name.cyan());
+    let results = auto_search_public(french_name);
+
+    if results.is_empty() {
+        return None;
+    }
+
+    let (id, title) = &results[0];
+    println!("AniSkip : {} {}", title.green(), format!("(ID: {})", id).dimmed());
+    cache.mappings.insert(french_name.to_string(), *id);
+    save_cache(cache);
+    Some(*id)
+}
+
 pub fn resolve_mal_id(
     french_name: &str,
     config: &MalConfig,
@@ -491,6 +562,17 @@ pub fn update_episode(mal_id: u64, episode: usize, is_completed: bool, config: &
         }
         Err(e) => println!("{} {}", "Erreur MAL:".red(), e),
     }
+}
+
+pub fn get_username(config: &MalConfig) -> Option<String> {
+    let client = reqwest::blocking::Client::new();
+    let resp = client
+        .get("https://api.myanimelist.net/v2/users/@me")
+        .header("Authorization", format!("Bearer {}", config.access_token))
+        .send()
+        .ok()?;
+    let json = parse_json(resp)?;
+    json.get("name").and_then(|v| v.as_str()).map(|s| s.to_string())
 }
 
 fn history_path() -> PathBuf {

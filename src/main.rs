@@ -18,6 +18,18 @@ use threadpool::ThreadPool;
 
 static DEBUG: AtomicBool = AtomicBool::new(false);
 
+struct WatchingState {
+    name: String,
+    lang: String,
+    season: i8,
+    episode: usize,
+    mal_id: Option<u64>,
+    total_episodes: usize,
+    is_last_season: bool,
+}
+
+static WATCHING: Mutex<Option<WatchingState>> = Mutex::new(None);
+
 fn is_debug() -> bool {
     DEBUG.load(Ordering::Relaxed)
 }
@@ -166,7 +178,90 @@ fn next_episode_signal_path() -> std::path::PathBuf {
         .join("next_episode.signal")
 }
 
-fn write_mpv_script(skip_times: &[mal::SkipTime], auto_next: bool) -> Option<std::path::PathBuf> {
+fn skip_cache_path() -> std::path::PathBuf {
+    directories::ProjectDirs::from("", "B0SE", "ani-fr")
+        .expect("Failed to get project directory")
+        .data_dir()
+        .join("skip_cache.json")
+}
+
+#[derive(serde::Serialize, serde::Deserialize, Clone, Debug)]
+struct CachedSkip {
+    skip_type: String, // "op" or "ed"
+    start: f64,
+    end: f64,
+}
+
+fn load_skip_cache(anime_name: &str, season: i8) -> Vec<CachedSkip> {
+    let path = skip_cache_path();
+    let data = match std::fs::read_to_string(&path) {
+        Ok(d) => d,
+        Err(_) => return Vec::new(),
+    };
+    let map: HashMap<String, Vec<CachedSkip>> = serde_json::from_str(&data).unwrap_or_default();
+    let key = format!("{}|{}", anime_name.to_lowercase(), season);
+    map.get(&key).cloned().unwrap_or_default()
+}
+
+fn save_skip_cache(anime_name: &str, season: i8, skips: &[CachedSkip]) {
+    let path = skip_cache_path();
+    let data = std::fs::read_to_string(&path).unwrap_or_default();
+    let mut map: HashMap<String, Vec<CachedSkip>> = serde_json::from_str(&data).unwrap_or_default();
+    let key = format!("{}|{}", anime_name.to_lowercase(), season);
+    map.insert(key, skips.to_vec());
+    if let Ok(json) = serde_json::to_string_pretty(&map) {
+        let _ = std::fs::write(&path, json);
+    }
+}
+
+fn parse_chapters_debug() -> Vec<CachedSkip> {
+    let dbg_path = directories::ProjectDirs::from("", "B0SE", "ani-fr")
+        .unwrap().data_dir().join("chapters_debug.txt");
+    let content = match std::fs::read_to_string(&dbg_path) {
+        Ok(c) => c,
+        Err(_) => return Vec::new(),
+    };
+
+    // Parse chapter lines: [idx] "Title" @ 123.4s
+    let mut chapters: Vec<(String, f64)> = Vec::new();
+    for line in content.lines() {
+        if let Some(start) = line.find('"') {
+            if let Some(end) = line[start+1..].find('"') {
+                let title = line[start+1..start+1+end].to_string();
+                if let Some(at) = line.find("@ ") {
+                    if let Some(s_off) = line[at+2..].find('s') {
+                        let s_end = at + 2 + s_off;
+                        if let Ok(time) = line[at+2..s_end].parse::<f64>() {
+                            chapters.push((title, time));
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    let mut skips = Vec::new();
+    for (i, (title, start)) in chapters.iter().enumerate() {
+        let t = title.to_lowercase();
+        let is_op = t == "op" || t == "opening" || t == "intro" || t.contains("opening") || t.contains("intro");
+        let is_ed = t == "ed" || t == "ending" || t == "credits" || t.contains("ending") || t.contains("credits");
+        if is_op || is_ed {
+            let end = if i + 1 < chapters.len() {
+                chapters[i + 1].1
+            } else {
+                start + 90.0 // fallback
+            };
+            skips.push(CachedSkip {
+                skip_type: if is_op { "op".to_string() } else { "ed".to_string() },
+                start: *start,
+                end,
+            });
+        }
+    }
+    skips
+}
+
+fn write_mpv_script(skip_times: &[mal::SkipTime], cached_skips: &[CachedSkip], auto_next: bool) -> Option<std::path::PathBuf> {
     let pos_file = mal::last_position_path();
     let pos_file_escaped = pos_file.display().to_string().replace('\\', "\\\\");
     let signal_file_escaped = next_episode_signal_path()
@@ -177,7 +272,8 @@ fn write_mpv_script(skip_times: &[mal::SkipTime], auto_next: bool) -> Option<std
     let mut lua = String::new();
 
     // Skip times section
-    if !skip_times.is_empty() {
+    let has_aniskip = !skip_times.is_empty();
+    if has_aniskip {
         lua.push_str("local skips = {\n");
         for s in skip_times {
             lua.push_str(&format!(
@@ -189,25 +285,180 @@ fn write_mpv_script(skip_times: &[mal::SkipTime], auto_next: bool) -> Option<std
         lua.push_str(&format!(
             r#"local skipped = {{}}
 local auto_next = {}
+local skip_timer = nil
 mp.observe_property("time-pos", "number", function(_, pos)
     if pos then
         for i, s in ipairs(skips) do
             if not skipped[i] and pos >= s.start and pos < s.ends then
                 skipped[i] = true
-                if string.lower(s.type) == "ed" and auto_next then
-                    mp.osd_message("Épisode suivant...", 2)
-                    local f = io.open("{}", "w")
-                    if f then
-                        f:write("next")
-                        f:close()
+                if skip_timer then skip_timer:kill() end
+                local label = string.upper(s.type)
+                mp.osd_message("Skip " .. label .. " dans 5s...", 5)
+                skip_timer = mp.add_timeout(5, function()
+                    if string.lower(s.type) == "ed" and auto_next then
+                        mp.osd_message("Épisode suivant...", 2)
+                        local f = io.open("{}", "w")
+                        if f then
+                            f:write("next")
+                            f:close()
+                        end
+                        mp.command("quit")
+                        return
                     end
-                    mp.command("quit")
-                    return
-                end
-                mp.commandv("seek", tostring(s.ends), "absolute")
-                mp.osd_message("Skip " .. string.upper(s.type), 2)
+                    mp.commandv("seek", tostring(s.ends), "absolute")
+                    mp.osd_message("Skip " .. label, 2)
+                end)
             end
         end
+    end
+end)
+"#,
+            if auto_next { "true" } else { "false" },
+            signal_file_escaped
+        ));
+    }
+
+    // Fallback: use mpv embedded chapters (OP/ED) when AniSkip has no data
+    // Also always use chapter fallback alongside AniSkip data
+    {
+        lua.push_str(&format!(
+            r#"local chapter_skipped = {{}}
+local chapter_auto_next = {}
+local chapters_logged = false
+local dbg_file
+local chapter_skip_timer = nil
+local function check_chapters()
+    local count = mp.get_property_number("chapter-list/count", 0)
+    if count == 0 then return end
+    if not chapters_logged then
+        chapters_logged = true
+        dbg_file = io.open("{dbg}", "w")
+        if dbg_file then
+            dbg_file:write("Chapters found: " .. count .. "\n")
+            for j = 0, count - 1 do
+                local ct = mp.get_property("chapter-list/" .. j .. "/title", "?")
+                local cs = mp.get_property_number("chapter-list/" .. j .. "/time", 0)
+                dbg_file:write("  [" .. j .. "] \"" .. ct .. "\" @ " .. string.format("%.1f", cs) .. "s\n")
+            end
+            dbg_file:flush()
+        end
+    end
+    local pos = mp.get_property_number("time-pos")
+    if not pos then return end
+    for i = 0, count - 1 do
+        local title = mp.get_property("chapter-list/" .. i .. "/title", "")
+        local start = mp.get_property_number("chapter-list/" .. i .. "/time", 0)
+        local next_start = nil
+        if i + 1 < count then
+            next_start = mp.get_property_number("chapter-list/" .. (i + 1) .. "/time", nil)
+        else
+            next_start = mp.get_property_number("duration", nil)
+        end
+        if title and next_start then
+            local t = string.lower(title)
+            local is_op = t == "op" or t == "opening" or t == "intro" or string.find(t, "opening") or string.find(t, "intro")
+            local is_ed = t == "ed" or t == "ending" or t == "credits" or string.find(t, "ending") or string.find(t, "credits")
+            if (is_op or is_ed) and not chapter_skipped[i] and pos >= start and pos < next_start then
+                chapter_skipped[i] = true
+                if dbg_file then
+                    dbg_file:write("SKIP triggered: \"" .. title .. "\" pos=" .. string.format("%.1f", pos) .. " -> " .. string.format("%.1f", next_start) .. "\n")
+                    dbg_file:flush()
+                end
+                if chapter_skip_timer then chapter_skip_timer:kill() end
+                local skip_target = next_start
+                local skip_title = title
+                local skip_is_ed = is_ed
+                mp.osd_message("Skip " .. string.upper(skip_title) .. " dans 5s...", 5)
+                chapter_skip_timer = mp.add_timeout(5, function()
+                    if skip_is_ed and chapter_auto_next then
+                        mp.osd_message("Épisode suivant...", 2)
+                        local f = io.open("{}", "w")
+                        if f then
+                            f:write("next")
+                            f:close()
+                        end
+                        mp.command("quit")
+                        return
+                    end
+                    mp.commandv("seek", tostring(skip_target), "absolute")
+                    mp.osd_message("Skip " .. string.upper(skip_title), 2)
+                end)
+            end
+        end
+    end
+end
+mp.observe_property("time-pos", "number", function(_, pos)
+    if pos then check_chapters() end
+end)
+mp.observe_property("chapter-list/count", "number", function()
+    check_chapters()
+end)
+"#,
+            if auto_next { "true" } else { "false" },
+            signal_file_escaped,
+            dbg = directories::ProjectDirs::from("", "B0SE", "ani-fr")
+                .unwrap().data_dir().join("chapters_debug.txt")
+                .display().to_string().replace('\\', "\\\\")
+        ));
+    }
+
+    // Cached skip times: show Netflix-style "Skip Intro/Outro" button
+    if !cached_skips.is_empty() {
+        lua.push_str("local cached_skips = {\n");
+        for s in cached_skips {
+            lua.push_str(&format!(
+                "  {{start={:.3}, ends={:.3}, type=\"{}\"}},\n",
+                s.start, s.end, s.skip_type
+            ));
+        }
+        lua.push_str("}\n");
+        lua.push_str(&format!(
+            r#"local cached_auto_next = {}
+local cached_active = nil
+local cached_triggered = {{}}
+local overlay = mp.create_osd_overlay("ass-events")
+local function show_skip_button(label)
+    overlay.data = "{{\\an3\\fs28\\bord2\\shad1\\1c&HFFFFFF&\\3c&H000000&\\pos(" ..
+        (mp.get_property_number("osd-width", 1920) - 40) .. "," ..
+        (mp.get_property_number("osd-height", 1080) - 60) .. ")}}" ..
+        "⏭ Skip " .. label
+    overlay:update()
+end
+local function hide_skip_button()
+    overlay:remove()
+    cached_active = nil
+    mp.remove_key_binding("cached-skip")
+end
+local function do_cached_skip()
+    if not cached_active then return end
+    local s = cached_active
+    hide_skip_button()
+    if string.lower(s.type) == "ed" and cached_auto_next then
+        mp.osd_message("Épisode suivant...", 2)
+        local f = io.open("{}", "w")
+        if f then
+            f:write("next")
+            f:close()
+        end
+        mp.command("quit")
+        return
+    end
+    mp.commandv("seek", tostring(s.ends), "absolute")
+    mp.osd_message("Skip " .. string.upper(s.type), 2)
+end
+mp.observe_property("time-pos", "number", function(_, pos)
+    if not pos then return end
+    for i, s in ipairs(cached_skips) do
+        if not cached_triggered[i] and pos >= s.start and pos < s.ends then
+            cached_triggered[i] = true
+            cached_active = s
+            local label = s.type == "op" and "Intro" or "Outro"
+            show_skip_button(label)
+            mp.add_forced_key_binding("ENTER", "cached-skip", do_cached_skip)
+        end
+    end
+    if cached_active and pos >= cached_active.ends then
+        hide_skip_button()
     end
 end)
 "#,
@@ -282,14 +533,14 @@ fn was_fullscreen() -> bool {
         .unwrap_or(false)
 }
 
-fn watch(link: &str, skip_times: &[mal::SkipTime], auto_next: bool, start_pos: Option<f64>) -> bool {
+fn watch(link: &str, skip_times: &[mal::SkipTime], cached_skips: &[CachedSkip], auto_next: bool, start_pos: Option<f64>) -> bool {
     let restore_fs = was_fullscreen();
     // Clear old signals
     let _ = std::fs::remove_file(mal::last_position_path());
     let _ = std::fs::remove_file(next_episode_signal_path());
     let _ = std::fs::remove_file(fullscreen_state_path());
 
-    let script_path = write_mpv_script(skip_times, auto_next);
+    let script_path = write_mpv_script(skip_times, cached_skips, auto_next);
     let mpv_paths = ["mpv", "C:\\Program Files\\MPV Player\\mpv.exe"];
     for path in mpv_paths {
         let mut cmd = std::process::Command::new(path);
@@ -326,6 +577,16 @@ fn watch(link: &str, skip_times: &[mal::SkipTime], auto_next: bool, start_pos: O
                     }
                 }
             }
+            if is_debug() {
+                let dbg_path = directories::ProjectDirs::from("", "B0SE", "ani-fr")
+                    .unwrap().data_dir().join("chapters_debug.txt");
+                if let Ok(content) = std::fs::read_to_string(&dbg_path) {
+                    eprintln!("[DEBUG] {}", content.trim());
+                } else {
+                    eprintln!("[DEBUG] No chapters detected by mpv");
+                }
+                let _ = std::fs::remove_file(&dbg_path);
+            }
             return next_episode_signal_path().exists();
         }
     }
@@ -338,17 +599,39 @@ fn watch(link: &str, skip_times: &[mal::SkipTime], auto_next: bool, start_pos: O
     false
 }
 
+fn save_on_exit() {
+    let state = WATCHING.lock().unwrap();
+    if let Some(ws) = state.as_ref() {
+        // Update MAL
+        if let Some(mal_id) = ws.mal_id {
+            if let Some(mut mal_config) = mal::load_config() {
+                if mal::ensure_token(&mut mal_config) {
+                    let is_completed = ws.episode == ws.total_episodes
+                        && ws.is_last_season;
+                    mal::update_episode(mal_id, ws.episode, is_completed, &mal_config);
+                }
+            }
+        }
+        // Save history
+        let last_pos = mal::read_last_position();
+        mal::update_history(&ws.name, &ws.lang, ws.season, ws.episode, last_pos);
+    }
+}
+
 fn main() {
     if env::args().any(|a| a == "--debug") {
         DEBUG.store(true, Ordering::Relaxed);
         eprintln!("{}", "[DEBUG MODE]".yellow());
     }
 
+    ctrlc::set_handler(|| {
+        save_on_exit();
+        std::process::exit(0);
+    }).ok();
+
     let file_path = data::data_file_path();
 
-    if !data::ensure_local_data(&file_path) {
-        data::sync_remote_in_background(file_path.clone());
-    }
+    data::ensure_local_data(&file_path);
 
     let mut sp = Spinner::new(Spinners::Moon, String::from("Chargement des animes"));
 
@@ -361,6 +644,9 @@ fn main() {
             std::process::exit(0);
         }
     };
+    drop(file);
+
+    data::sync_remote_in_background(file_path.clone());
 
     sp.stop_with_symbol(" ✔️ ");
 
@@ -465,10 +751,33 @@ fn main() {
 
         if ans == mal_label {
             if mal::is_logged_in() {
-                let options = vec!["Déconnexion", "Retour"];
+                let options = vec!["Ma liste anime", "Mon historique", "Déconnexion", "Retour"];
                 if let Ok(choice) = Select::new("MAL :", options).prompt() {
-                    if choice == "Déconnexion" {
-                        mal::logout();
+                    match choice {
+                        "Ma liste anime" => {
+                            if let Some(mut cfg) = mal::load_config() {
+                                if mal::ensure_token(&mut cfg) {
+                                    if let Some(name) = mal::get_username(&cfg) {
+                                        let url = format!("https://myanimelist.net/animelist/{}", name);
+                                        let _ = open::that(&url);
+                                    }
+                                }
+                            }
+                        }
+                        "Mon historique" => {
+                            if let Some(mut cfg) = mal::load_config() {
+                                if mal::ensure_token(&mut cfg) {
+                                    if let Some(name) = mal::get_username(&cfg) {
+                                        let url = format!("https://myanimelist.net/history/{}", name);
+                                        let _ = open::that(&url);
+                                    }
+                                }
+                            }
+                        }
+                        "Déconnexion" => {
+                            mal::logout();
+                        }
+                        _ => {}
                     }
                 }
             } else {
@@ -478,19 +787,21 @@ fn main() {
         }
 
         // Resolve MAL ID early so watching is seamless
-        let mal_anime_id: Option<u64> = if mal::is_logged_in() {
-            if let Some(mut mal_config) = mal::load_config() {
-                if mal::ensure_token(&mut mal_config) {
-                    let mut cache = mal::load_cache();
-                    mal::resolve_mal_id(&ans, &mal_config, &mut cache)
+        let mal_anime_id: Option<u64> = {
+            let mut cache = mal::load_cache();
+            if mal::is_logged_in() {
+                if let Some(mut mal_config) = mal::load_config() {
+                    if mal::ensure_token(&mut mal_config) {
+                        mal::resolve_mal_id(&ans, &mal_config, &mut cache)
+                    } else {
+                        mal::resolve_mal_id_public(&ans, &mut cache)
+                    }
                 } else {
-                    None
+                    mal::resolve_mal_id_public(&ans, &mut cache)
                 }
             } else {
-                None
+                mal::resolve_mal_id_public(&ans, &mut cache)
             }
-        } else {
-            None
         };
 
         let is_ext = ans == "\u{4f}\u{74}\u{6f}\u{6b}\u{75}\u{72}\u{69}\u{6b}\u{6b}\u{61}";
@@ -720,8 +1031,38 @@ fn main() {
                                         eprintln!("[DEBUG] No skip times found");
                                     }
                                 }
+                                // Load cached skip times if no AniSkip data
+                                let cached_skips = if skip_times.is_empty() {
+                                    load_skip_cache(&ans, ans3.season)
+                                } else {
+                                    Vec::new()
+                                };
+                                if is_debug() && !cached_skips.is_empty() {
+                                    eprintln!("[DEBUG] Using cached skip times: {:?}", cached_skips);
+                                }
                                 let resume_pos = history_timestamp.take();
-                                let auto_next = watch(ep_url, &skip_times, has_next, resume_pos);
+                                // Set watching state for Ctrl+C failsafe
+                                *WATCHING.lock().unwrap() = Some(WatchingState {
+                                    name: ans.clone(),
+                                    lang: ans3.lang.clone(),
+                                    season: ans3.season,
+                                    episode: current_ep + 1,
+                                    mal_id: mal_anime_id,
+                                    total_episodes: ans3.episodes.len(),
+                                    is_last_season: ans3.season == animes3.last().unwrap().season,
+                                });
+                                let auto_next = watch(ep_url, &skip_times, &cached_skips, has_next, resume_pos);
+                                // Clear watching state (normal exit will handle saving below)
+                                *WATCHING.lock().unwrap() = None;
+
+                                // Save detected chapters to cache for future episodes
+                                let detected = parse_chapters_debug();
+                                if !detected.is_empty() {
+                                    save_skip_cache(&ans, ans3.season, &detected);
+                                    if is_debug() {
+                                        eprintln!("[DEBUG] Saved skip cache: {:?}", detected);
+                                    }
+                                }
 
                                 // MAL update after watching
                                 if let Some(mal_id) = mal_anime_id {
